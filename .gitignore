@@ -1,0 +1,14 @@
+# Compiled files
+*.o
+nimd
+test
+
+# Submission/archive files
+P4.tar
+
+# macOS files
+.DS_Store
+Icon?
+
+# Course files
+p4.pdf
