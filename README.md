@@ -1,193 +1,377 @@
-CS 214 Project IV: Nim (nimd)
+# Multithreaded TCP Nim Server
 
-Authors
-  RL857 - Ritika Luthra
-  SND84 - Sanika Deshmukh
+A concurrent TCP server written in C that supports multiple simultaneous Nim games using POSIX threads, thread-safe message queues, custom TCP protocol framing, and synchronized client management.
 
-Level attempted
-  Concurrent games (section 4.2) AND the extra credit (section 4.3).
+This project was developed for Rutgers University CS 214 Project IV and implements the concurrent game architecture (Section 4.2) and extra-credit requirements (Section 4.3).
 
-  nimd runs every game on its own threads, so any number of games proceed at
-  the same time and no game waits on another.  Within a game, each player has
-  a dedicated reader thread, so the server reacts to whichever player sends a
-  message first.  It does not wait for the player whose turn it is.  That is
-  what makes the two extra-credit cases work:
+## Highlights
 
-    - If it is player 1's turn and player 2 sends MOVE, player 2 immediately
-      receives FAIL "31 Impatient".  Player 1's move is not required first.
-    - If player 2 disconnects while player 1 is still thinking, player 1 is
-      immediately declared the winner by forfeit.
+- Supports multiple Nim games concurrently
+- Uses POSIX threads for connection handling and game execution
+- Implements a dedicated reader thread for each player
+- Uses bounded, thread-safe message queues to coordinate reader threads and game managers
+- Implements custom TCP message framing and protocol validation
+- Handles partial and multiple messages within a TCP stream
+- Detects malformed input and applies protocol-specific error codes
+- Handles out-of-turn moves without blocking on the current player
+- Detects client disconnects and awards forfeits
+- Uses per-connection receive buffers to prevent shared parser state
+- Protects the player registry and matchmaking lobby with mutexes
+- Includes automated unit and end-to-end tests
 
-1. Building and running
+## Architecture
 
-  make            builds nimd and the test program
-  ./nimd <port>   starts the server, for example ./nimd 4000
-  ./test          runs the unit tests (prints "N checks, 0 failures")
-  make clean      removes the binaries and object files
+Multiple games run independently at the same time. Each active game has its own game manager, message queue, and pair of reader threads.
 
-  nimd logs connections, moves and results to STDOUT.
+```text
+              incoming TCP connections
+                         |
+                         v
+              +---------------------+
+              |  nimd accept() loop |
+              +----------+----------+
+                         |
+        one handshake thread per connection
+                         |
+                         v
+              +---------------------+
+              |  matchmaking lobby  |
+              +----------+----------+
+                         |
+    pairs waiting players into independent games
+                         |
+     +---------+---------+---------+---------+
+     |         |         |         |         |
+  Game 1    Game 2    Game 3    Game 4      ...
+```
 
-  Note on testing by hand: nimd sends exactly the bytes the protocol
-  defines and does not append a newline, because a stray byte would break the
-  message length used for framing.  This means that with plain nc the replies
-  arrive without line breaks and several may appear run together on one line,
-  which is correct.  nc also appends a newline to whatever you type; nimd
-  tolerates the extra byte at the start of the next message only if you send
-  well-formed messages, so for exact testing prefer a client that does not
-  add a newline:
+Each game is a self-contained set of three threads:
 
-    printf '0|11|OPEN|Alice|' | nc localhost 4000
+```text
+   client A socket       client B socket
+          |                     |
+          v                     v
+   +--------------+      +--------------+
+   | Reader (P1)  |      | Reader (P2)  |
+   +------+-------+      +------+-------+
+          |                     |
+          +----------+----------+
+                     |
+                     v
+          +---------------------+
+          | bounded queue       |
+          | mutex + 2 cond vars |
+          +----------+----------+
+                     |
+                     v
+          +---------------------+
+          | game manager thread |
+          +----------+----------+
+                     |
+                     v
+          +---------------------+
+          | board + turn state  |
+          +---------------------+
+```
 
-2. Architecture
+### Server
 
-  nimd.c          listening socket, OPEN/WAIT handshake, the lobby of
-                  unmatched players, the registry of connected players, and
-                  the pairing of players into games
-  game_thread.c   the reader threads, the game manager thread, and the
-                  message queue that connects them
-  game.c          the Nim rules: the board, legal moves, and end of game
-  protocol.c      message framing: parsing received bytes into messages and
-                  building messages to send
-  test.c          unit tests for framing and the Nim rules
+`nimd.c` is responsible for:
 
-  Threads
-    - One thread per connection performs the handshake, so a slow or silent
-      client never holds up the listening socket.
-    - Each game has one manager thread and two reader threads.  The readers
-      only turn bytes into messages and push them onto a bounded queue; the
-      manager pops from that queue and is the only thread that touches the
-      board and the turn.  This keeps the game rules in one place and means
-      no lock is needed on the game state itself.
-    - The queue is guarded by a mutex with one condition variable for "not
-      empty" and one for "not full".
+- Listening for TCP connections
+- Processing the initial `OPEN` handshake
+- Maintaining the connected-player registry
+- Managing the matchmaking lobby
+- Pairing players into games
+- Starting game threads
 
-  Shared state
-    - The list of connected players is guarded by its own mutex.  Testing a
-      name and inserting it happen under a single lock, so two clients
-      connecting at once cannot both claim the same name.
-    - The lobby of unmatched players is guarded by its own mutex.
-    - Locks are always taken lobby-then-players, never the other way, so
-      there is no possibility of deadlock.
+### Game threads
 
-  Memory ownership
-    - Every connection owns its own receive buffer, so no parser state is
-      shared between connections.
-    - A player's name and receive buffer are created by the handshake, handed
-      to the lobby, and then handed to the game.  The game manager frees them
-      when the game ends.
-    - A received message is freed in exactly one place: the manager's loop,
-      after it has been handled.
-    - At the end of a game the manager closes the queue, shuts down both
-      sockets to wake the readers, joins both readers, and only then frees
-      the game.  Nothing is freed while a reader could still be using it.
+Each active game uses one game manager thread and one reader thread per player.
 
-3. Protocol
+Reader threads receive and parse messages from their respective TCP connections and place them into a bounded message queue.
 
-  Messages are 0|LL|TYPE|field|...|, where LL is two decimal digits giving the
-  number of bytes after "0|LL|".  A complete message is therefore 5 + LL bytes
-  and always ends with a vertical bar.
+The game manager is the only thread that modifies the board and turn state. This keeps game-state updates serialized without requiring a separate lock around the game state itself.
 
-  Framing is validated both ways, as section 3.4.2 requires: the stated length
-  must be exactly two digits, the type code must be four known characters, and
-  the message must contain exactly the number of bar-terminated fields that
-  its type requires, with the last bar as the final byte.  Anything else is
-  answered with FAIL "10 Invalid" and the connection is closed.
+## Concurrency
 
-  Invalid byte sequences are rejected as early as possible rather than by
-  waiting for more data.  For example "0|1|" is refused after four bytes,
-  because the length field is not two digits.
+Games are managed independently, allowing multiple games to progress concurrently without one game blocking another.
 
-  Because TCP does not preserve message boundaries, the receiver keeps a
-  buffer per connection and handles all four cases:
-    - a partial message: keep the bytes and read more
-    - one complete message: consume exactly 5 + LL bytes
-    - several complete messages from one read: each is returned in turn, and
-      no read() is made while a complete message is still buffered
-    - a complete message followed by a partial one: the complete message is
-      returned and the remainder is kept for later
+Within a game, reader threads process messages independently of whose turn it is. This allows the server to immediately respond to an out-of-turn move instead of waiting for the current player.
 
-  Bytes that arrive before a player is matched are kept and carried into the
-  game, so nothing is lost at the handshake boundary.
+For example:
 
-  Error codes sent
-    10 Invalid          message cannot be parsed or is misframed      (closes)
-    21 Long Name        player name longer than 72 characters         (closes)
-    22 Already Playing  that name is already connected                (closes)
-    23 Already Open     OPEN sent a second time                       (closes)
-    24 Not Playing      MOVE sent before the game began               (closes)
-    31 Impatient        MOVE sent during the opponent's turn
-    32 Pile Index       pile number outside 1-5
-    33 Quantity         asked to remove too many or too few stones
+```text
+player 2 sends MOVE (out of turn)
+            |
+            v
+     Reader Thread 2          <- never waits for player 1
+            |
+            v
+     Message Queue
+            |
+            v
+     Game Manager             <- not player 2's turn
+            |
+            v
+     FAIL 31 Impatient        <- replied immediately
+```
 
-  Sessions
-    - A client that disconnects after OPEN but before NAME is dropped and is
-      not matched with anyone.
-    - A client that disconnects after NAME but before OVER forfeits, and the
-      remaining player is sent OVER with "Forfeit".
-    - After OVER the server closes the connection, and the player's name
-      becomes available again.
+This architecture also allows a player disconnecting during the opponent's turn to be detected and handled as a forfeit.
 
-4. Nim
+## Synchronization
 
-  Every game starts with five piles of 1, 3, 5, 7 and 9 stones.  Players take
-  turns removing at least one stone from a single pile.  Whoever removes the
-  last stone wins.  Player 1 moves first.
+The server uses POSIX synchronization primitives to coordinate shared state safely.
 
-5. Test plan
+### Message queue
 
-  Automated unit tests (./test), 69 checks:
-    - every message builder reproduces the exact examples in the write-up,
-      including OVER with an empty final field and OVER with "Forfeit"
-    - a 72-character name fits; an oversized one is refused instead of
-      overrunning the buffer
-    - parsing OPEN, WAIT, and OVER, including an empty field
-    - a message delivered a few bytes at a time is reported as incomplete
-      until the last byte arrives, then parsed correctly
-    - two whole messages plus the start of a third from one read: both are
-      returned and the partial bytes are kept
-    - malformed input is rejected: wrong version, missing version bar, a
-      one-digit length, a non-numeric length, a length too small to hold a
-      type, an unknown type, an unterminated type code, a field not
-      terminated inside the stated length, an extra field inside the stated
-      length, fields running past the stated length, and a name containing a
-      vertical bar
-    - input that is merely short is reported as incomplete, not invalid
-    - bytes past the stated length belong to the next message
-    - over a real socket: send_msg puts exactly the framed bytes on the wire,
-      two messages written separately are both recovered, and a closed peer
-      is reported as closed rather than as a framing error
-    - the Nim rules: starting board, pile and quantity range checks, removing
-      from the right pile, and detecting the end of the game
+Each game has a bounded message queue protected by:
 
-  End-to-end tests against a running server, 31 checks, all passing:
-    - both players receive WAIT after their own OPEN
-    - both receive NAME with the right player number and opponent name,
-      followed immediately by the first PLAY
-    - a valid move updates the board, both players are sent the new PLAY, and
-      the turn changes
-    - out-of-turn MOVE is answered with 31 Impatient at once, without waiting
-      for the other player (extra credit)
-    - pile 9 gives 32 Pile Index; removing 5 from a pile of 1 gives 33
-      Quantity; the connection stays open in both cases
-    - two MOVE messages written as one block are both processed
-    - playing to the last stone gives OVER with the winner and an empty third
-      field
-    - a duplicate name gives 22, a 73-character name gives 21, "0|1|" and an
-      unknown type give 10, MOVE before OPEN gives 24, a second OPEN gives 23
-    - an OPEN split across two writes is reassembled
-    - a player disconnecting mid-game gives the other OVER with "Forfeit"
-    - a player who leaves while waiting is dropped, and the next two live
-      players are matched with each other
-    - two games run at once: a move in one game is processed while the other
-      game sits idle, and both stay responsive
-    - a name can be reused after its game ends
+- `pthread_mutex_t`
+- Condition variables for queue availability
+- A closed-state flag for coordinated shutdown
 
-  Concurrency and memory checks:
-    - built and run under ThreadSanitizer: no data races reported across
-      concurrent games, disconnects and forfeits
-    - built and run under AddressSanitizer: no invalid accesses reported
-    - 250 sequential games plus rejected and abandoned connections plus a
-      burst of 80 clients connecting at once (40 simultaneous games): all 80
-      were matched, memory stayed flat, and the server ended holding fewer
-      open descriptors than a freshly started one, so sockets and threads are
-      not accumulating
+Reader threads push received messages into the queue while the game manager consumes them.
+
+### Player registry
+
+The server maintains a registry of connected player names protected by a mutex.
+
+Checking whether a name is already in use and adding the name occur under the same lock, preventing two simultaneous connections from claiming the same name.
+
+### Matchmaking lobby
+
+The lobby of unmatched players is also protected by a mutex. Lock ordering is kept consistent to avoid deadlock between shared server components.
+
+## Connection and memory management
+
+Each TCP connection maintains its own receive buffer. This prevents multiple reader threads from sharing parser state and allows independent connections to be processed safely.
+
+At the end of a game, shutdown follows an explicit order:
+
+1. Close the message queue
+2. Shut down both client sockets
+3. Wake blocked reader threads
+4. Join the reader threads
+5. Release game resources
+
+This prevents reader threads from accessing memory after the game state has been freed.
+
+Received protocol messages are dynamically allocated and released after processing.
+
+## TCP protocol
+
+The server implements a custom application-layer protocol using the following framing format:
+
+```text
+0|LL|TYPE|field1|field2|...|
+```
+
+`LL` is a two-digit length field representing the number of bytes following the length prefix. A complete message therefore contains `5 + LL` bytes and ends with a vertical bar.
+
+### Supported message types
+
+| Type | Sent by | Fields |
+| --- | --- | --- |
+| `OPEN` | client | player name |
+| `WAIT` | server | none |
+| `NAME` | server | player number, opponent name |
+| `PLAY` | server | next player, board state |
+| `MOVE` | client | pile, quantity |
+| `FAIL` | either | error code and message |
+| `OVER` | server | winner, final board, forfeit flag |
+
+### Framing
+
+The protocol implementation validates:
+
+- Protocol version
+- Two-digit length field
+- Message length
+- Message type
+- Required field count
+- Field termination
+- Final message delimiter
+
+Malformed messages are rejected with the appropriate protocol error.
+
+### TCP stream handling
+
+Because TCP is a byte stream rather than a message-oriented protocol, a single `read()` may contain:
+
+- Part of a message
+- Exactly one message
+- Multiple complete messages
+- A complete message followed by part of another message
+
+The receiver maintains buffered data for each connection and processes complete messages without requiring additional reads.
+
+For example:
+
+```text
+one read() may return:
+
+  +------------------+------------------+-----------+
+  | complete message | complete message |  partial  |
+  +------------------+------------------+-----------+
+   ^                  ^                  ^
+   processed now      processed now      buffered until
+                                         more bytes arrive
+```
+
+## Error handling
+
+The server implements protocol-specific error codes for invalid client behavior.
+
+| Code | `FAIL` text | Meaning | Connection |
+| --- | --- | --- | --- |
+| 10 | `10 Invalid` | Invalid or misframed message | Closed |
+| 21 | `21 Long Name` | Player name longer than 72 characters | Closed |
+| 22 | `22 Already Playing` | Name is already connected | Closed |
+| 23 | `23 Already Open` | `OPEN` sent more than once | Closed |
+| 24 | `24 Not Playing` | `MOVE` sent before the game began | Closed |
+| 31 | `31 Impatient` | `MOVE` sent during the opponent's turn | Remains open |
+| 32 | `32 Pile Index` | Pile index outside 1-5 | Remains open |
+| 33 | `33 Quantity` | Quantity too large or too small | Remains open |
+
+Malformed protocol input is handled separately from client disconnects. A malformed message results in an appropriate `FAIL` response, while a mid-game disconnect results in a forfeit and an `OVER` message to the remaining player.
+
+## Nim game logic
+
+Each game starts with five piles:
+
+```text
+1 3 5 7 9
+```
+
+Players alternate turns and may remove one or more stones from a single pile. Player 1 moves first. The player who removes the final stone wins.
+
+The game logic validates:
+
+- Pile indices
+- Move quantities
+- Turn order
+- Remaining stones
+- End-of-game conditions
+- Winner determination
+
+## Project structure
+
+| File | Description |
+| --- | --- |
+| `nimd.c` | TCP server, handshake, matchmaking, and player management |
+| `game_thread.c` | Reader threads, game manager, and message queue |
+| `game_thread.h` | Threading, queue, and game-state definitions |
+| `game.c` | Nim game rules and move validation |
+| `game.h` | Nim game interface |
+| `protocol.c` | TCP message parsing and message construction |
+| `protocol.h` | Protocol definitions and interfaces |
+| `test.c` | Automated unit and integration tests |
+| `Makefile` | Build configuration |
+| `AUTHOR` | Project authors |
+
+## Building
+
+Build the server and test program:
+
+```bash
+make
+```
+
+Run the automated test suite:
+
+```bash
+./test
+```
+
+Clean compiled binaries and object files:
+
+```bash
+make clean
+```
+
+## Running the server
+
+Start the server on a specified TCP port:
+
+```bash
+./nimd 4000
+```
+
+The server listens for incoming TCP client connections and automatically matches available players into games.
+
+## Manual testing
+
+A basic two-player connection can be tested with `nc`:
+
+```bash
+printf '0|11|OPEN|Alice|' | nc localhost 4000
+```
+
+and from another terminal:
+
+```bash
+printf '0|09|OPEN|Bob|' | nc localhost 4000
+```
+
+The protocol does not append a newline to responses because message boundaries are determined by the protocol's length field. For exact protocol testing, clients should send only the framed bytes shown above.
+
+## Testing
+
+The project includes automated tests covering protocol parsing, TCP framing, game logic, concurrency, error handling, and connection management.
+
+### Unit tests
+
+The unit test suite contains 69 checks covering:
+
+- Message construction
+- Message parsing
+- TCP framing
+- Partial messages
+- Multiple messages in a single read
+- Messages split across multiple writes
+- Malformed frames
+- Invalid length fields
+- Unknown message types
+- Missing and extra fields
+- Empty fields
+- Long player names
+- TCP disconnects
+- Nim game rules
+- Move validation
+- Game completion
+
+### End-to-end tests
+
+The integration test suite contains 31 checks covering:
+
+- Player matchmaking
+- Duplicate-name rejection
+- Complete handshake
+- Valid gameplay
+- Out-of-turn moves
+- Invalid pile indices
+- Invalid quantities
+- Multiple messages in one TCP write
+- Client disconnects and forfeits
+- Name reuse after a game ends
+- Multiple simultaneous games
+- Partial `OPEN` messages
+- Protocol violations
+
+### Concurrency and memory testing
+
+The server was additionally tested using:
+
+- ThreadSanitizer for data-race detection
+- AddressSanitizer for invalid memory access detection
+- Sequential game execution
+- Multiple simultaneous games
+- Abandoned and rejected connections
+- High-volume concurrent connections
+
+## Technologies
+
+C, POSIX threads (pthread), TCP/IP sockets, mutexes, condition variables, thread-safe queues, a custom application-layer protocol, dynamic memory management, Make, AddressSanitizer, ThreadSanitizer, and Git.
+
+Rutgers University, Computer Science 214.
